@@ -1,0 +1,104 @@
+# Builds the tornado wheels ninetyfive installs (free-threaded CPython 3.14t) for
+# x86_64 and aarch64, and attaches them to the release. PyPI only has abi3
+# wheels, which 3.14t cannot load, so ninetyfive's image otherwise compiles the
+# speedups extension from source on every build.
+
+name: Build ninetyfive wheels
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and upload to"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.14t"
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  IMPORT_NAME: tornado.speedups
+  DIST_NAME: tornado
+  CHECK_DEPS: ""
+
+defaults:
+  run:
+    shell: bash -x -e -u -o pipefail {0}
+
+jobs:
+  build:
+    name: tornado (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22.04 runners, as ninetyfive's DeepGEMM and flash-attention wheels.
+        os: [ubuntu-22.04, ubuntu-22.04-arm]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Record the start time
+        run: echo "BUILD_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Build wheel
+        uses: pypa/cibuildwheel@v4.3.0
+        env:
+          CIBW_BUILD: cp314t-manylinux_*
+          # Tested below with ninetyfive's PYTHON_GIL=0 instead of upstream's suite.
+          CIBW_TEST_SKIP: "*"
+        with:
+          output-dir: dist
+
+      - name: Report build time
+        run: echo "::notice title=${{ matrix.os }}::built in $(( $(date +%s) - BUILD_START )) seconds"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Check the wheel
+        # One free-threaded CPython 3.14 wheel for this runner's architecture,
+        # which imports with the GIL disabled, as ninetyfive runs it (PYTHON_GIL=0).
+        run: |
+          ls -la dist
+          wheels=(dist/*.whl)
+          [ "${#wheels[@]}" -eq 1 ]
+          name="$(basename "${wheels[0]}")"
+          [[ "${name}" == *-cp314-cp314t-manylinux_*_"$(uname -m)".whl ]] || { echo "unexpected wheel tags: ${name}"; exit 1; }
+          python -m pip install --upgrade pip
+          python -m pip install ${CHECK_DEPS} "${wheels[0]}"
+          cd /tmp
+          PYTHON_GIL=0 python -W error::RuntimeWarning -c "
+          import sys, importlib, importlib.metadata as md
+          importlib.import_module('${IMPORT_NAME}')
+          assert not sys._is_gil_enabled()
+          print('${DIST_NAME}', md.version('${DIST_NAME}'))
+          "
+          # Informational: whether the extension declares free-threading support.
+          python -c "import sys, ${IMPORT_NAME}; print('GIL re-enabled without PYTHON_GIL=0:', sys._is_gil_enabled())"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheel-${{ matrix.os }}
+          path: dist/*.whl
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # uploads.github.com intermittently answers HTTP 500; retry.
+        run: |
+          for attempt in 1 2 3 4 5; do
+            gh release upload "${RELEASE_TAG}" dist/*.whl --clobber --repo "${GITHUB_REPOSITORY}" && exit 0
+            sleep $((attempt * 15))
+          done
+          exit 1
