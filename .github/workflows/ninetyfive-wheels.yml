@@ -73,7 +73,7 @@ jobs:
           wheels=(dist/*.whl)
           [ "${#wheels[@]}" -eq 1 ]
           name="$(basename "${wheels[0]}")"
-          [[ "${name}" == *-cp314-cp314t-manylinux_*_"$(uname -m)".whl ]] || { echo "unexpected wheel tags: ${name}"; exit 1; }
+          [[ "${name}" == *-cp314-cp314t-*manylinux*_"$(uname -m)".whl ]] || { echo "unexpected wheel tags: ${name}"; exit 1; }
           python -m pip install --upgrade pip
           python -m pip install ${CHECK_DEPS} "${wheels[0]}"
           cd /tmp
